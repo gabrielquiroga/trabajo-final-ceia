@@ -33,7 +33,8 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.9.1",
     "torchvision>=0.24.1",
-    "scikit-optimize>=0.8.1"
+    "scikit-optimize>=0.8.1",
+    "torch-geometric>=2.7.0",
 ]
 
 [project.optional-dependencies]
