@@ -25,13 +25,13 @@ class TrajectoryGenerator:
     
     @staticmethod
     def parabolic(n_points, a=1.0, h=0, k=0, x_range=(-1, 1)):
-        x = np.linspace(x_range, x_range[1], n_points)
+        x = np.linspace(x_range[0], x_range[1], n_points)
         y = a * (x - h)**2 + k
         return np.stack([x, y], axis=1)
 
     @staticmethod
     def exponential(n_points, a=1.0, b=1.0, x_range=(0, 2)):
-        x = np.linspace(x_range, x_range[1], n_points)
+        x = np.linspace(x_range[0], x_range[1], n_points)
         y = a * np.exp(b * x)
         return np.stack([x, y], axis=1)
 
