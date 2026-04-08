@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import to_hetero
 
-from sinusoidal_position_embeddings import SinusoidalPositionEmbeddings
-from base_gnn import BaseGNN
+from src.classes.sinusoidal_position_embeddings import SinusoidalPositionEmbeddings
+from src.classes.base_gnn import BaseGNN
 
 
 # =====================================================================
