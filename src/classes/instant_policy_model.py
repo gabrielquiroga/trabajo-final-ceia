@@ -9,11 +9,29 @@ from src.classes.base_gnn import BaseGNN
 # =====================================================================
 # 3. Arquitectura Principal: GNN + Diffusion
 # =====================================================================
+# El __init__ construye 4 submódulos:
+# A) Dos nn.Linear(2, hidden_dim) separados para proyectar coordenadas [x, y] al espacio latente. Son independientes
+# para que el modelo aprenda representaciones distintas según si el nodo es de contexto (escena) o de acción (trayectoria).
+# B) Un nn.Sequential que combina el embedding sinusoidal con dos capas lineales (con cuello de botella 64→128→64),
+# dando al modelo capacidad de transformar no-linealmente la representación del tiempo.
+# C) to_hetero(base_gnn, metadata, aggr='sum') replica internamente los pesos de BaseGNN para cada tipo de arista del
+# grafo, creando una GNN que puede procesar relaciones heterogéneas. Con aggr='sum', cuando un nodo recibe mensajes de
+# múltiples tipos de aristas, los suma.
+# D) El noise_predictor es un MLP que toma la concatenación del embedding de grafo y del tiempo [128-dim] y lo proyecta de
+# vuelta a [2] (el ruido predicho en x e y).
+#
+# En el forward, el momento más delicado es la alineación de batches: PyTorch Geometric representa un batch de grafos
+# apilando todos sus nodos en un solo tensor, y el vector .batch actúa como un índice que mapea cada nodo al grafo original.
+# Con t_emb[batch_idx] se "expande" el embedding de tiempo del grafo correcto a cada uno de sus nodos, igualando las
+# dimensiones para poder concatenar.
+
 class InstantPolicyModel(nn.Module):
     def __init__(self, metadata, node_features=2, hidden_dim=64):
         super().__init__()
         
         # A. Expansión inicial de features [x, y] -> [hidden_dim]
+        # Dos capas nn.Linear(2, 64) independientes para nodos de tipo context y action. Aunque la estructura es la misma,
+        # tienen pesos distintos: el modelo puede aprender representaciones latentes diferentes según el rol del nodo.
         self.action_emb = nn.Linear(node_features, hidden_dim)
         self.context_emb = nn.Linear(node_features, hidden_dim)
 
@@ -38,8 +56,11 @@ class InstantPolicyModel(nn.Module):
         )
 
     def forward(self, hetero_data, timestep):
-        # NOTA CLAVE: En la etapa de entrenamiento, hetero_data['action'].x 
-        # no contendrá la trayectoria limpia, sino la trayectoria CON RUIDO aplicado.
+        # NOTA CLAVE: En la etapa de entrenamiento, hetero_data['action'].x no contendrá la
+        # trayectoria limpia, sino la trayectoria CON RUIDO aplicado.
+        # Durante el entrenamiento de difusión, el input action.x es la trayectoria ruidosa x_t = x_0 + ε·σ_t.
+        # La red aprende a predecir el ruido ε que fue añadido, NO la trayectoria limpia directamente. Esto
+        # es el objetivo estándar del noise prediction (ε-parametrization) de DDPM.
         
         # 1. Proyectar las coordenadas [x, y] al espacio latente
         x_dict = {
@@ -48,7 +69,10 @@ class InstantPolicyModel(nn.Module):
         }
 
         # 2. Paso de Mensajes (Message Passing) en el grafo heterogéneo
-        # Utiliza los tensores de aristas definidos en tu notebook anterior
+        # Utiliza los tensores de aristas definidos en el notebook de preprocesamiento.
+        # La GNN heterogénea itera sobre cada tipo de arista en edge_index_dict. Para cada
+        # arista (tipo_origen, tipo_relación, tipo_destino), corre una instancia independiente
+        # de SAGEConv. Los mensajes que llegan de distintos tipos se combinan con aggr='sum'.
         node_embeddings = self.gnn(x_dict, hetero_data.edge_index_dict)
 
         # Extraemos solo los features actualizados de los nodos que queremos predecir
@@ -63,6 +87,8 @@ class InstantPolicyModel(nn.Module):
         # para que coincida con cada nodo individual perteneciente a ese grafo en el batch.
         if hasattr(hetero_data['action'], 'batch') and hetero_data['action'].batch is not None:
             batch_idx = hetero_data['action'].batch
+            # El vector .batch indica a qué grafo pertenece cada nodo (ej. [0,0,0,1,1,1,2,2]).
+            # Se usa como índice para replicar el embedding de tiempo correcto a cada nodo.
             t_emb = t_emb[batch_idx] 
         else:
             # Si estamos inferiendo un solo grafo sin DataLoader
