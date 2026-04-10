@@ -69,7 +69,7 @@ class InstantPolicyModel(nn.Module):
         }
 
         # 2. Paso de Mensajes (Message Passing) en el grafo heterogéneo
-        # Utiliza los tensores de aristas definidos en el notebook de preprocesamiento.
+        # Utiliza los tensores de aristas definidos en el preprocesamiento.
         # La GNN heterogénea itera sobre cada tipo de arista en edge_index_dict. Para cada
         # arista (tipo_origen, tipo_relación, tipo_destino), corre una instancia independiente
         # de SAGEConv. Los mensajes que llegan de distintos tipos se combinan con aggr='sum'.

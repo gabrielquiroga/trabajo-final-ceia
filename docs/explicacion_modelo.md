@@ -370,7 +370,7 @@ sequenceDiagram
     Input->>Time: Paso t (ej: 42)
     Note over Time: 42 → embedding sinusoidal → MLP
     Time->>Fusion: Embedding de tiempo [64 dims]
-    Note over Fusion: Concatena [GNN output ; tiempo] = [128 dims]
+    Note over Fusion: Concatena [GNN output , tiempo] = [128 dims]
     Fusion->>Output: Ruido predicho [ruido_x, ruido_y]
 ```
 
