@@ -208,61 +208,98 @@ La belleza de esta fórmula es que permite saltar **directamente** de $x_0$ a cu
 **Propósito**: Esta es la **red neuronal principal**. Integra la GNN con el proceso de difusión. Recibe un grafo heterogéneo (con trayectoria ruidosa) y un timestep `t`, y predice el ruido `ε` que fue añadido.
 
 ```python
-class InstantPolicyModel(torch.nn.Module):
+class InstantPolicyModel(nn.Module):
     def __init__(self, metadata, node_features=2, hidden_dim=64):
         super().__init__()
-        # 1. Embeddings temporales: codifica el timestep t
-        self.time_embed = SinusoidalPositionEmbeddings(hidden_dim)
-        # 2. Proyección de features: expande (x,y) a hidden_dim dimensiones
-        self.feature_proj = nn.Linear(node_features, hidden_dim)
-        # 3. GNN heterogénea: convierte la BaseGNN homogénea
-        base_gnn = BaseGNN(hidden_dim, hidden_dim, hidden_dim)
-        self.gnn = to_hetero(base_gnn, metadata)
-        # 4. Cabeza de predicción de ruido: reduce hidden_dim a node_features (2)
-        self.noise_pred_head = nn.Linear(hidden_dim, node_features)
+
+        # A. Dos proyecciones SEPARADAS para context y action
+        self.action_emb = nn.Linear(node_features, hidden_dim)
+        self.context_emb = nn.Linear(node_features, hidden_dim)
+
+        # B. MLP para procesar el Time Embedding (Sinusoidal + capas lineales)
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(hidden_dim),   # 64D → 64D
+            nn.Linear(hidden_dim, hidden_dim * 2),      # 64D → 128D
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim)       # 128D → 64D
+        )
+
+        # C. GNN heterogénea
+        base_gnn = BaseGNN(hidden_dim)
+        self.gnn = to_hetero(base_gnn, metadata=metadata, aggr='sum')
+
+        # D. MLP Predictor de Ruido (entrada = GNN output + tiempo concatenados)
+        self.noise_predictor = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # 128D → 64D
+            nn.GELU(),
+            nn.Linear(hidden_dim, node_features)    # 64D → 2 (ruido_x, ruido_y)
+        )
 ```
 
-**Línea por línea**:
-- `SinusoidalPositionEmbeddings(hidden_dim)`: crea el codificador de timesteps (ver sección 2.2).
-- `nn.Linear(node_features, hidden_dim)`: una capa lineal que transforma las coordenadas `(x, y)` (2 dimensiones) en un vector de `hidden_dim` dimensiones (ej: 64). Esto es necesario porque la GNN trabaja en un espacio de mayor dimensión para tener más capacidad expresiva.
-- `to_hetero(base_gnn, metadata)`: la función clave de PyTorch Geometric. Toma la `BaseGNN` homogénea y la convierte automáticamente en una GNN heterogénea, duplicando los parámetros para cada tipo de nodo y arista definido en `metadata`.
-- `nn.Linear(hidden_dim, node_features)`: la "cabeza" final que reduce la representación de alta dimensión de vuelta a las 2 coordenadas `(x, y)`, generando la **predicción de ruido**.
+**Línea por línea del `__init__`**:
+
+- **A. Proyecciones separadas**: A diferencia de usar un solo `nn.Linear` compartido, el modelo tiene **dos capas lineales independientes** (`context_emb` y `action_emb`). Ambas transforman coordenadas `(x, y)` de 2D a `hidden_dim` (64D), pero al tener **pesos distintos**, permiten que el modelo aprenda representaciones latentes diferentes según el rol del nodo (referencia de escena vs. punto de trayectoria). Esta separación es una decisión de diseño importante que refuerza la distinción entre los dos tipos de nodo.
+
+- **B. Time MLP**: No es un simple embedding sinusoidal, sino un `nn.Sequential` que combina:
+  1. `SinusoidalPositionEmbeddings(64)`: transforma el escalar `t` en un vector de 64D.
+  2. `nn.Linear(64, 128)`: expande la representación (cuello de botella invertido).
+  3. `nn.GELU()`: activación no lineal.
+  4. `nn.Linear(128, 64)`: comprime de vuelta a 64D.
+
+  Este MLP adicional le da al modelo más capacidad para aprender transformaciones no lineales de la información temporal, versus usar el embedding sinusoidal directamente.
+
+- **C. `to_hetero(base_gnn, metadata, aggr='sum')`**: Convierte la `BaseGNN` homogénea en heterogénea. El parámetro `aggr='sum'` indica que cuando un nodo recibe mensajes de *múltiples tipos de arista* (ej: un nodo `action` recibe de `context→action` Y de `action→action`), los **suma**. Otras opciones serían `'mean'` o `'max'`.
+
+- **D. Noise Predictor MLP**: La cabeza final es un MLP de **dos capas** (no una sola capa lineal). Recibe un vector de `hidden_dim * 2 = 128` dimensiones (la **concatenación** de las features del grafo + embedding temporal) y lo proyecta a las 2 coordenadas de ruido predicho. El MLP intermedio con GELU da más capacidad expresiva que una simple proyección lineal.
 
 ```python
-    def forward(self, hetero_data, timesteps):
-        # --- Paso 1: Proyectar features de TODOS los tipos de nodo ---
-        x_dict = {}
-        for node_type in hetero_data.node_types:
-            x_dict[node_type] = self.feature_proj(hetero_data[node_type].x)
+    def forward(self, hetero_data, timestep):
+        # 1. Proyectar coordenadas al espacio latente (con embeddings SEPARADOS)
+        x_dict = {
+            'context': self.context_emb(hetero_data['context'].x),
+            'action':  self.action_emb(hetero_data['action'].x)
+        }
 
-        # --- Paso 2: Generar el embedding temporal ---
-        t_emb = self.time_embed(timesteps.float())
+        # 2. Message Passing en el grafo heterogéneo
+        node_embeddings = self.gnn(x_dict, hetero_data.edge_index_dict)
+        action_features = node_embeddings['action']  # Solo nodos action
 
-        # --- Paso 3: Inyectar el timestep en los nodos 'action' ---
-        # Mapear timestep por grafo a timestep por nodo
-        node_t_emb = t_emb[hetero_data['action'].batch]
-        x_dict['action'] = x_dict['action'] + node_t_emb
+        # 3. Procesar el tiempo con el MLP
+        t_emb = self.time_mlp(timestep)
 
-        # --- Paso 4: Pasar por la GNN heterogénea ---
-        edge_index_dict = hetero_data.edge_index_dict
-        out_dict = self.gnn(x_dict, edge_index_dict)
+        # 4. Alineación de batches: expandir t_emb a cada nodo action
+        if hasattr(hetero_data['action'], 'batch') and hetero_data['action'].batch is not None:
+            batch_idx = hetero_data['action'].batch
+            t_emb = t_emb[batch_idx]
+        else:
+            t_emb = t_emb.expand(action_features.shape[0], -1)
 
-        # --- Paso 5: Predecir el ruido solo para nodos 'action' ---
-        predicted_noise = self.noise_pred_head(out_dict['action'])
+        # 5. CONCATENAR (no sumar) features del grafo + tiempo, luego predecir
+        fused_features = torch.cat([action_features, t_emb], dim=-1)  # → 128D
+        predicted_noise = self.noise_predictor(fused_features)         # → 2D
         return predicted_noise
 ```
 
 **Forward Pass - Flujo completo**:
 
-1.  **Proyección de features** (`feature_proj`): Todas las coordenadas `(x, y)` de nodos `context` y `action` se transforman de 2D a 64D.
-2.  **Embedding temporal** (`time_embed`): El timestep `t` se convierte en un vector de 64D.
-3.  **Inyección del timestep**: El embedding temporal se **suma** a las features de los nodos `action`. Esto es fundamental: le dice al modelo "estamos en el paso t del proceso de difusión".
-    - `hetero_data['action'].batch`: este tensor mapea cada nodo a su grafo dentro del batch. Si el batch tiene 16 grafos con 50 nodos action cada uno, hay 800 nodos; `.batch` es un tensor de 800 elementos que indica a qué grafo (0-15) pertenece cada nodo. Así, cada nodo recibe el timestep de **su** grafo.
-4.  **Message Passing** (GNN): La GNN procesa el grafo completo. Los nodos `action` reciben información de los nodos `context` (a través de las aristas `context → action`) y de otros nodos `action` (a través de aristas `action → action`). Esto es lo que le da al modelo la capacidad de generar trayectorias **condicionadas** al contexto.
-5.  **Predicción de ruido**: Solo las salidas de los nodos `action` pasan por la cabeza lineal final para producir la predicción de ruido en el espacio original de 2 coordenadas.
+1.  **Proyección de features** (con embeddings separados): Las coordenadas `(x, y)` de nodos `context` pasan por `context_emb` y las de `action` por `action_emb`. Cada tipo de nodo se proyecta a 64D con pesos independientes.
+
+2.  **Message Passing** (GNN): La GNN heterogénea procesa el grafo completo. Los nodos `action` reciben información de los nodos `context` (vía aristas `context → action`) y de otros nodos `action` (vía aristas `action → action`). Los mensajes de distintos tipos de arista se combinan con `aggr='sum'`. Esto es lo que permite que la trayectoria generada esté **condicionada** al contexto.
+
+3.  **Procesamiento temporal**: El timestep `t` pasa por el `time_mlp`, un MLP que transforma la señal sinusoidal cruda en una representación más expresiva de 64D.
+
+4.  **Alineación de batches**: PyTorch Geometric apila los nodos de todos los grafos del batch en un solo tensor. El vector `.batch` mapea cada nodo a su grafo de origen. Se usa como índice para que cada nodo action reciba el embedding temporal de **su** grafo correcto.
+    - Ejemplo: si el batch tiene 16 grafos con 50 nodos action cada uno, hay 800 nodos totales; `.batch` es un tensor de 800 elementos `[0,0,...,0, 1,1,...,1, ..., 15,15,...,15]`.
+    - Con `t_emb[batch_idx]`, el embedding temporal del grafo `i` se replica para cada uno de sus nodos action.
+    - El `else` cubre el caso de inferencia (un solo grafo, sin DataLoader).
+
+5.  **Fusión y predicción**: Las features del GNN y el embedding temporal se **concatenan** (no se suman) en un vector de 128D. Este vector pasa por el `noise_predictor` MLP para producir la predicción final de ruido en 2 coordenadas `(ruido_x, ruido_y)`.
 
 > [!IMPORTANT]
 > El modelo NO predice la trayectoria directamente. Predice el **ruido ε** que fue añadido a la trayectoria limpia. Esta es la **parametrización ε**, estándar en modelos DDPM.
+
+> [!NOTE]
+> **Concatenación vs. Suma**: El modelo usa `torch.cat` (concatenación) para fusionar las features del grafo con el tiempo, no suma directa. La concatenación preserva ambas señales íntegramente en canales separados, dando al MLP posterior la libertad de aprender cómo combinarlas. La suma, en cambio, mezcla las señales de forma aditiva, lo que puede perder información cuando las dos representaciones tienen escalas o significados muy distintos.
 
 ---
 
