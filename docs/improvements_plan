@@ -1,20 +1,23 @@
-# Revisión Integral del Proyecto "Instant Policy" — Hallazgos y Plan de Acción
+# Revisión Integral del Proyecto "Instant Policy" — v2 (Actualizado)
+
+> [!NOTE]
+> Esta versión corrige observaciones del análisis previo basándose en los comentarios del autor y en una re-revisión del código actualizado.
 
 ## 1. Resumen del Estado Actual
 
-El proyecto implementa un modelo de **difusión basado en GNN heterogénea** para predicción de trayectorias 2D, con los siguientes componentes ya funcionales:
-
 | Componente | Estado | Archivos |
 |---|---|---|
-| Generación de trayectorias | ✅ Funcional | [trajectory_generator.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/trajectory_generator.py) |
-| Generación de dataset (HDF5) | ✅ Funcional | [examples_generation.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/examples_generation.ipynb) |
-| Grafos Heterogéneos | ✅ Funcional | [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb) |
+| Generación de trayectorias | ✅ Funcional | [trajectory_generator.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/trajectory_generator.py), [examples_generation_v2.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/examples_generation_v2.ipynb) |
+| Generación de dataset (HDF5) | ✅ Funcional (v2) | dataset_instant_policy_2d_v2.h5 |
+| Normalización conjunta | ✅ Funcional | `normalize_pair()` en el notebook |
+| Grafos Heterogéneos (3 tipos de arista) | ✅ Funcional | `build_hetero_graph()` en el notebook |
 | Embeddings sinusoidales | ✅ Funcional | [sinusoidal_position_embeddings.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/sinusoidal_position_embeddings.py) |
 | GNN Base (SAGEConv) | ✅ Funcional | [base_gnn.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/base_gnn.py) |
-| DDPM Scheduler | ✅ Funcional (con observaciones) | [DDPMScheduler.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/DDPMScheduler.py) |
+| DDPM Scheduler | ✅ Funcional | [DDPMScheduler.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/DDPMScheduler.py) |
 | Modelo principal | ✅ Funcional | [instant_policy_model.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/instant_policy_model.py) |
-| Loop de entrenamiento | ✅ Funcional (con observaciones) | [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb) |
-| Loop de inferencia (sampling) | ⚠️ Implementado pero con error en varianza | [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb) |
+| Loop de entrenamiento | ✅ Funcional | [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb) |
+| Loop de inferencia (sampling) | ✅ Funcional (con observación menor) | [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb) |
+| Separación train/test | ❌ Faltante | — |
 | Métricas de evaluación | ❌ Faltante | — |
 | Visualización comparativa | ⚠️ Parcial | — |
 | Guardado/carga de modelo | ❌ Faltante | — |
@@ -23,115 +26,149 @@ El proyecto implementa un modelo de **difusión basado en GNN heterogénea** par
 
 ## 2. Problemas Encontrados y Recomendaciones
 
-### 2.1 🔴 Error Crítico: Varianza posterior incorrecta en el paso reverso (Inferencia)
+### 2.1 🟢 Varianza en el paso reverso DDPM — Aclaración (Corregido)
 
-> [!CAUTION]
-> La fórmula de la varianza `sigma_t` usada en `ddpm_reverse_step` es **incorrecta** y probablemente sea la causa principal de mala calidad en las trayectorias generadas.
+> [!NOTE]
+> Tras re-analizar, la fórmula actual **es correcta**. La confusión era autoimpuesta; a continuación se documenta el razonamiento para que quede claro.
 
-En el código de inferencia ([heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb), líneas ~1010-1012):
+En el código de inferencia:
 
 ```python
-# Código actual (INCORRECTO):
 sigma_t = torch.sqrt(1.0 - alpha_t)
 ```
 
-La varianza correcta del proceso reverso DDPM (como se define en el paper original de Ho et al.) es la **varianza posterior**:
+Dado que en DDPM se define `alpha_t = 1 - beta_t`, entonces `1 - alpha_t = beta_t`. Por lo tanto:
+
+```
+sigma_t = sqrt(1 - alpha_t) = sqrt(beta_t)
+```
+
+Esto corresponde exactamente a la **varianza fija** (`σ²_t = β_t`) del paper original de Ho et al. (2020). Es una de las dos opciones válidas de varianza para el paso reverso:
+
+1. **Varianza fija (la que estás usando):** `σ²_t = β_t` — más simple, perfectamente válida
+2. **Varianza posterior:** `σ²_t = β̃_t = β_t · (1 − ᾱ_{t-1}) / (1 − ᾱ_t)` — teóricamente óptima, da muestras ligeramente mejores
+
+**Recomendación**: El código actual es correcto. Para documentarlo mejor, se sugiere agregar un comentario explícito:
 
 ```python
-# Varianza correcta:
-alpha_cumprod_t_prev = scheduler.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0)
+# Varianza fija del DDPM: σ²_t = β_t (Ho et al., 2020, Eq. 11)
+# Nota: sqrt(1 - alpha_t) = sqrt(beta_t) por definición de alpha_t = 1 - beta_t
+sigma_t = torch.sqrt(1.0 - alpha_t)
+```
+
+Opcionalmente, se puede mejorar la calidad de las muestras generadas implementando la varianza posterior:
+
+```python
+# Varianza posterior (teóricamente óptima):
+alpha_cumprod_t_prev = scheduler.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0, device=device)
 beta_t = scheduler.betas[t].to(device)
 sigma_t = torch.sqrt(beta_t * (1.0 - alpha_cumprod_t_prev) / (1.0 - alpha_cumprod_t))
 ```
 
-Alternativamente, una simplificación válida (y más simple) es usar `sigma_t = sqrt(beta_t)`, que corresponde a la varianza "no reducida" del paper original. **Pero `sqrt(1 - alpha_t)` es `sqrt(beta_t)` sólo por definición: `alpha_t = 1 - beta_t`**, así que en realidad la fórmula actual SÍ es `sqrt(beta_t)`, que es la varianza fija del paper original. 
+---
 
-Sin embargo, al revisar más cuidadosamente: la fórmula actual **sí es una simplificación válida** (varianza fija `σ_t = β_t`). La confusión viene del comentario que dice "simplificación estándar" sin explicar cuál de las dos varianzas se usa. Recomendación: documentar esto explícitamente o implementar la varianza posterior real para mejor calidad.
+### 2.2 ✅ Normalización de datos — Ya implementada (Confirmado)
 
-### 2.2 🟡 Problema Importante: Normalización de datos NO implementada
+La función `normalize_pair()` ya está implementada y es llamada dentro de `build_hetero_graph()` (línea 100 del notebook). La normalización es **conjunta** y **uniforme** (usa el máximo rango de ambos ejes), lo cual es correcto para la tarea.
 
-> [!WARNING]
-> El código de carga del dataset tiene un comentario `# NORMALIZAR LAS COORDENADAS SI NO LO ESTÁN!` pero la normalización **nunca se implementa realmente**. Esto puede afectar significativamente el rendimiento del entrenamiento.
+No se necesita normalización adicional en el loop de carga del dataset. El comentario viejo en el notebook (`# NORMALIZAR LAS COORDENADAS SI NO LO ESTÁN!`) es un vestigio de una versión anterior y debería eliminarse para evitar confusión.
 
-```python
-# Código actual (líneas 940-943 del notebook):
-for key, graph in iter_dataset_as_graphs(HDF5_PATH):
-    # NORMALIZAR LAS COORDENADAS SI NO LO ESTÁN!
-    # Ej: graph['action'].x = (graph['action'].x - mean) / std
-    dataset_list.append(graph)
+---
+
+### 2.3 ✅ Aristas context ↔ context — Ya implementadas (Confirmado)
+
+El código en `build_hetero_graph()` (líneas 156-167) implementa correctamente aristas secuenciales bidireccionales para los nodos `context`. Esto fue verificado en la salida del notebook:
+
+```
+(context, to, context)={ edge_index=[2, 14] }
 ```
 
-**Impacto**: Las trayectorias tienen rangos muy diferentes según el tipo (parabólicas pueden tener rangos de y mucho más amplios que lineales). Sin normalización:
-- El scheduler DDPM asume que los datos están en un rango razonable
-- La predicción de ruido se vuelve inconsistente entre diferentes tipos de trayectoria
-- La convergencia del entrenamiento se ve afectada
+Esto corresponde a 8 nodos context × 2 (bidireccional) - 2 (extremos) = 14 aristas, lo cual es correcto.
 
-**Recomendación**: Implementar normalización **conjunta** (context + target al mismo rango `[-1, 1]`) preservando la relación espacial entre ambos, como se había discutido en conversaciones previas.
+---
 
-### 2.3 🟡 Problema Importante: dtype inconsistente en timesteps
+### 2.4 🟡 Separación de datos train/test — Problema real
 
-En el archivo [instant_policy_model.py](file:///c:/CEIA/trabajo-final-ceia/src/classes/instant_policy_model.py), el `time_mlp` recibe el timestep como entrada al embedding sinusoidal. Pero en la inferencia ([heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb), línea ~987):
+> [!IMPORTANT]
+> El problema principal aquí **no** es la inconsistencia técnica del batch handling (que funciona correctamente), sino que **se usan los mismos datos para entrenamiento e inferencia**. Sin un conjunto de test separado, no hay forma de medir si el modelo realmente generaliza.
 
+Actualmente:
+- Se entrena con **todas** las 2000 demos del dataset
+- Se hace inferencia sobre grafos que el modelo ya "vio" durante el entrenamiento
+- Esto puede dar resultados engañosamente buenos sin que haya verdadera generalización
+
+**Recomendación** (dos opciones):
+
+1. **Split train/val/test**: Dividir las 2000 demos existentes (ej: 70/15/15)
+2. **Generar datos de test nuevos**: Crear un segundo dataset con `examples_generation_v2.ipynb` usando parámetros aleatorios diferentes, garantizando que son trayectorias que el modelo nunca vio
+
+La opción 2 es más robusta conceptualmente para un proyecto final, ya que demuestra generalización a trayectorias genuinamente nuevas.
+
+---
+
+### 2.5 🟡 dtype inconsistente en timesteps
+
+En la inferencia (`ddpm_reverse_step`):
 ```python
 t_tensor = torch.tensor([t], device=device, dtype=torch.long)
 ```
 
-El dtype es `torch.long` (int64), pero el `SinusoidalPositionEmbeddings` realiza operaciones de punto flotante (`sin`, `cos`, multiplicación con floats). Aunque PyTorch hace casting automático en muchos casos, **esto puede causar warnings o errores sutiles** dependiendo de la versión.
-
-**Recomendación**: Usar `dtype=torch.float32` para los timesteps, o hacer un `.float()` explícito dentro del embedding sinusoidal.
-
-### 2.4 🟡 Problema Importante: Inconsistencia entre entrenamiento e inferencia
-
-> [!IMPORTANT]
-> Durante el entrenamiento, los timesteps se muestrean **aleatoriamente** por batch y se expanden a cada nodo vía `batch_idx`. Pero durante la inferencia, se pasa un solo grafo `sin` DataLoader, y el `t_emb` se expande con `.expand()`. Esto funciona, pero hay una inconsistencia sutil: **durante el entrenamiento, cada grafo del batch tiene su propio timestep, mientras que en inferencia se usa un único timestep para todo el grafo**. Esto es correcto conceptualmente, pero debe asegurarse de que la alineación batch funcione simétricamente.
-
-### 2.5 🟡 Red GNN demasiado superficial
-
-La `BaseGNN` tiene sólo **2 capas** de SAGEConv. Para grafos heterogéneos donde la información debe fluir entre nodos `context` y `action` a través de aristas k-NN:
-
-- 2 capas SAGEConv pueden no ser suficientes para capturar relaciones complejas
-- El campo receptivo es muy limitado (cada nodo solo "ve" a 2 hops de distancia)
-
-**Recomendación**: Considerar 3-4 capas SAGEConv, o agregar conexiones residuales (skip connections) para permitir que la información fluya más profundamente sin degradación de gradientes.
-
-### 2.6 🟢 Observación Menor: Sin aristas `context ↔ context` secuenciales
-
-Al revisar la construcción de grafos en [heterogeneous_graphs.ipynb](file:///c:/CEIA/trabajo-final-ceia/src/heterogeneous_graphs.ipynb), se mencionan aristas secuenciales para `action ↔ action` pero también deberían existir para `context ↔ context` según la documentación previa. Verificar que estas aristas estén correctamente implementadas.
-
-### 2.7 🟢 Observación Menor: `num_action_nodes` hardcodeado en inferencia
-
+Pero el `SinusoidalPositionEmbeddings` realiza:
 ```python
-def generate_trajectory(model, scheduler, context_graph, num_action_nodes=50, device='cpu'):
+embeddings = time[:, None] * embeddings[None, :]  # multiplicación float
 ```
 
-Si los grafos de entrenamiento tienen un número diferente de nodos action (ej: `n_points=100` en la generación de datos), esto causará una discrepancia. Debe coincidir con el número usado en entrenamiento.
+El `time[:, None]` es `torch.long`, y se multiplica con un tensor float. PyTorch hace casting implícito, pero es mejor ser explícito:
 
-### 2.8 🟢 Observación Menor: `DDPMScheduler` no guarda estado de device
+```python
+# Opción 1: cambiar el dtype al crear el tensor
+t_tensor = torch.tensor([t], device=device, dtype=torch.float32)
 
-El scheduler almacena `betas`, `alphas`, `alphas_cumprod` en CPU por defecto, y hace `.to(device)` cada vez en `add_noise()`. Es más eficiente moverlos al device correcto una sola vez.
+# Opción 2: castear dentro del embedding
+embeddings = time.float()[:, None] * embeddings[None, :]
+```
+
+**Impacto**: Bajo (funciona gracias al casting automático de PyTorch), pero es buena práctica corregirlo.
+
+---
+
+### 2.6 🟡 `num_action_nodes` inconsistente entre entrenamiento e inferencia
+
+En `generate_trajectory()`:
+```python
+def generate_trajectory(model, scheduler, context_graph, num_action_nodes=50, ...):
+```
+
+Pero en el dataset v2, los grafos tienen tamaños de action nodes variables (se observa `action={ x=[100, 2] }` en la salida). Si el modelo fue entrenado con 100 nodos action, la inferencia con 50 producirá resultados inconsistentes.
+
+**Recomendación**: El `num_action_nodes` debería coincidir con el número de nodos action usado en el entrenamiento, o al menos pasarse como parámetro explícito desde los datos de test.
+
+---
+
+### 2.7 🟢 GNN de 2 capas — Observación menor
+
+La `BaseGNN` con 2 capas SAGEConv puede ser suficiente para la PoC con trayectorias 2D simples. Si los resultados de generación no son satisfactorios, considerar:
+- Agregar 1-2 capas más
+- Agregar residual connections (`x = self.conv1(x, edge_index) + x_original`)
+- Aumentar `hidden_dim` de 64 a 128
 
 ---
 
 ## 3. Componentes Faltantes para Finalizar el Proyecto
 
-### 3.1 ❌ Sistema de Normalización de Datos
-- Normalización conjunta `[-1, 1]` para pares (context, target)
-- Almacenar estadísticas de normalización para desnormalizar en inferencia
-- Aplicar desnormalización a las trayectorias generadas
+### 3.1 ❌ Generación de datos de test separados
+- Crear un segundo dataset con nuevas trayectorias (diferentes semillas/parámetros)
+- O implementar un split train/val/test del dataset existente
+- Indispensable para medir generalización
 
-### 3.2 ❌ Métricas de Evaluación Cuantitativa
-Para un proyecto final completo se necesitan métricas como:
-- **Chamfer Distance**: distancia promedio al punto más cercano entre la trayectoria generada y la ground truth
-- **Fréchet Distance**: similitud entre distribuciones de trayectorias
-- **Suavidad** (smoothness): derivada segunda de la trayectoria (jerk)
-- **MSE / MAE**: entre trayectoria generada y target normalizado
+### 3.2 ❌ Métricas de evaluación cuantitativa
+Para un proyecto final completo se necesitan al menos 2-3 de estas métricas:
+- **Mean Squared Error (MSE)**: entre trayectoria generada y target ground truth (post-normalización)
+- **Chamfer Distance**: distancia promedio al punto más cercano entre las dos trayectorias
+- **Suavidad (smoothness)**: magnitud del "jerk" (derivada segunda discreta), para verificar que la trayectoria no tiene saltos bruscos
+- **Fréchet Distance**: similitud geométrica de trayectorias considerando el orden
 
-### 3.3 ❌ Visualización Comparativa Robusta
-- Función que muestre: contexto (demo) + target (ground truth) + generada, en el mismo plot
-- Visualización del proceso de denoising paso a paso (ya parcialmente implementada)
-- Comparativa por tipo de trayectoria
-
-### 3.4 ❌ Guardado y Carga del Modelo
+### 3.3 ❌ Guardado y carga del modelo
 ```python
 # Guardar
 torch.save({
@@ -139,6 +176,7 @@ torch.save({
     'optimizer_state_dict': optimizer.state_dict(),
     'epoch': epoch,
     'loss': loss,
+    'metadata': metadata,
 }, 'checkpoint.pth')
 
 # Cargar
@@ -146,66 +184,60 @@ checkpoint = torch.load('checkpoint.pth')
 model.load_state_dict(checkpoint['model_state_dict'])
 ```
 
-### 3.5 ❌ Refactorización del Código de Entrenamiento
-El loop de entrenamiento está embebido en un notebook. Para un proyecto final debería:
-- Extraerse a un módulo Python reutilizable (ej: `src/training/train.py`)
-- Incluir logging con TensorBoard o Weights & Biases
-- Soportar early stopping basado en validation loss
-- Tener un split train/validation apropiado
+Esto permite:
+- Retomar entrenamiento si se interrumpe
+- Evaluar sin re-entrenar
+- Demostrar el modelo en la presentación final
 
-### 3.6 ❌ Validación durante Entrenamiento
-- Separar el dataset en train/validation (ej: 80/20)
+### 3.4 ❌ Validación durante entrenamiento
 - Calcular validation loss cada N epochs
-- Implementar early stopping si la validation loss no mejora
+- Implementar early stopping si la val loss no mejora
+- Separar al menos un 15-20% de datos para validación
 
-### 3.7 ⚠️ Hiperparámetros por Afinar
-| Parámetro | Valor Actual | Observación |
+### 3.5 ⚠️ Visualización comparativa robusta
+Ya hay visualizaciones parciales (proceso de denoising). Para el proyecto final conviene una función que muestre en el mismo plot:
+- Contexto (demo experta) en un color
+- Target (ground truth) en otro
+- Trayectoria generada por el modelo en otro
+- Con leyenda y título indicando el tipo de trayectoria
+
+### 3.6 ⚠️ Limpieza del notebook
+- Eliminar comentarios obsoletos (ej: `# NORMALIZAR LAS COORDENADAS SI NO LO ESTÁN!`)
+- Mover funciones reutilizables a módulos Python (`src/training/`, `src/evaluation/`)
+- Agregar docstrings a las funciones del notebook
+
+### 3.7 ⚠️ Hiperparámetros por afinar
+| Parámetro | Valor Actual | Recomendación |
 |---|---|---|
-| `num_timesteps` | 100 | Considerar 200-1000 para mejor calidad |
-| `hidden_dim` | 64 | Probar 128 para mayor capacidad |
-| `k_neighbors` | 5 | Probar valores como 3, 7, 10 |
-| `learning_rate` | 1e-3 | Considerar scheduler de learning rate |
-| `epochs` | 20 | Insuficiente, probar 100+ con early stopping |
-| `batch_size` | 16 | OK para GPU, ajustar según VRAM |
-| Capas GNN | 2 | Probar 3-4 con residual connections |
+| `num_timesteps` | 100 | OK para PoC, probar 200 si hay tiempo |
+| `hidden_dim` | 64 | Probar 128 si los resultados son pobres |
+| `k_neighbors` | 5 | Probar 3 y 7 para ver impacto |
+| `learning_rate` | 1e-3 | Agregar LR scheduler (CosineAnnealing) |
+| `epochs` | 50 | Suficiente si la loss se estabiliza |
+| `batch_size` | 8 | OK para CPU; 32+ para GPU |
+| Capas GNN | 2 | Probar 3 si la calidad no es buena |
 
 ---
 
-## 4. Plan de Acción Recomendado (Priorizado)
+## 4. Plan de Acción Priorizado
 
-### Fase 1: Correcciones Críticas
-1. Implementar normalización de datos (context + target) a `[-1, 1]`
-2. Documentar/corregir la varianza en el paso reverso DDPM
-3. Corregir el `num_action_nodes` en inferencia para que sea consistente con entrenamiento
-4. Corregir dtype de timesteps a `float32`
+### Fase 1: Correcciones rápidas (1-2 horas)
+1. ~~Corregir dtype de timesteps a `float32` en inferencia~~
+2. ~~Corregir `num_action_nodes` para que coincida con los datos de entrenamiento~~
+3. ~~Eliminar comentarios obsoletos del notebook~~
+4. ~~Documentar la fórmula de varianza~~
 
-### Fase 2: Mejoras de Arquitectura
-5. Agregar más capas a la BaseGNN (con residual connections)
-6. Mover los tensores del DDPMScheduler al device correcto una sola vez
-7. Implementar split train/validation con evaluación periódica
+### Fase 2: Datos y evaluación (3-4 horas)
+5. Implementar split train/val o generar dataset de test separado
+6. Implementar 2-3 métricas de evaluación cuantitativa
+7. Crear función de visualización comparativa (context + target + generada)
 
-### Fase 3: Completar Pipeline
-8. Implementar métricas de evaluación (Chamfer Distance, suavidad)
-9. Implementar guardado/carga de checkpoints
-10. Crear visualizaciones comparativas robustas
-11. Implementar desnormalización de resultados
+### Fase 3: Robustez del entrenamiento (2-3 horas)
+8. Implementar guardado/carga de checkpoints
+9. Agregar validation loss al loop de entrenamiento
+10. Opcional: agregar LR scheduler
 
-### Fase 4: Polish Final
-12. Refactorizar entrenamiento a script Python independiente
-13. Agregar logging (TensorBoard)
-14. Tuning de hiperparámetros
-15. Documentación del proyecto
-
----
-
-## 5. Resumen del Análisis de la Curva de Pérdida
-
-La curva de aprendizaje muestra que la loss baja rápidamente en las primeras 5 epochs (de ~0.55 a ~0.10) y luego se estabiliza alrededor de **0.08-0.09**. Esto sugiere:
-
-- ✅ El modelo converge (buena señal)
-- ⚠️ La convergencia es rápida, lo que puede indicar que el modelo tiene capacidad insuficiente o que la tarea es "fácil" con sólo 4 tipos de trayectorias activas
-- ⚠️ Sin validation loss, no sabemos si hay overfitting
-- ⚠️ 20 epochs puede ser insuficiente — extender con early stopping
-
-> [!TIP]
-> Recomiendo que priorices la **Fase 1** completa antes de seguir con las demás. La normalización de datos es probablemente el cambio que más impacto tendrá en la calidad de las trayectorias generadas.
+### Fase 4: Polish final (1-2 horas)
+11. Refactorizar funciones a módulos Python
+12. Ajuste fino de hiperparámetros
+13. Documentación final del proyecto

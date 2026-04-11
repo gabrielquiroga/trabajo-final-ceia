@@ -26,7 +26,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         # Broadcasting para multiplicar el tiempo escalar por las frecuencias
         # time[:, None] convierte el vector de tiempo de forma [batch_size] a [batch_size, 1], y embeddings[None, :] convierte el vector de frecuencias
         # de forma [half_dim] a [1, half_dim], lo que permite la multiplicación elemento a elemento resultando en un tensor de forma [batch_size, half_dim]
-        embeddings = time[:, None] * embeddings[None, :] 
+        embeddings = time.float()[:, None] * embeddings[None, :] 
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
     
